@@ -11,30 +11,38 @@ import signal
 import subprocess
 import shutil
 import re
+import shlex
+import tempfile
+import urllib.request
+import urllib.parse
 from pathlib import Path
-from typing import Optional, Dict, List, Set
+from typing import Optional, Dict, List, Set, Any, Tuple
 from datetime import datetime
+import fnmatch
 
 # ============================================================
 # 常量定义
 # ============================================================
 
 CONFIG_DIR = Path.home() / ".config" / "service-cli"
-MODULES_DIR = CONFIG_DIR / "modules"
-FUNCTIONS_BASE_DIR = CONFIG_DIR / "function"
+MODULE_BASE_DIR = CONFIG_DIR / "module"
+DATA_BASE_DIR = CONFIG_DIR / "data"
 SETTINGS_FILE = CONFIG_DIR / "settings.json"
-REDIRECT_FILE = CONFIG_DIR / "redirect.conf"
-FORCE_FILE = CONFIG_DIR / "force.conf"
-SORT_FILE = CONFIG_DIR / "sort.conf"
 SUDO_CACHE_FILE = CONFIG_DIR / "command-sudo.txt"
 VIOLATIONS_LOG = CONFIG_DIR / "violations.log"
+MANIFEST_FILE = CONFIG_DIR / "manifest.json"
 
 # 默认配置
 DEFAULT_SETTINGS = {
     "redirect": 100,
     "force": "off",
-    "sort": "module"  # module 或 command
+    "sort": "module",
+    "repo": "",
+    "shell": ""
 }
+
+# 支持的压缩格式
+SUPPORTED_ARCHIVE_EXTENSIONS = {'.zip', '.tar.gz', '.7z', '.tar'}
 
 # ============================================================
 # SIGINT 信号处理
@@ -53,54 +61,78 @@ signal.signal(signal.SIGINT, signal_handler)
 
 def ensure_config_dirs():
     """确保配置目录存在"""
-    MODULES_DIR.mkdir(parents=True, exist_ok=True)
-    FUNCTIONS_BASE_DIR.mkdir(parents=True, exist_ok=True)
-    
-    # 初始化配置文件
-    if not SETTINGS_FILE.exists():
-        save_settings(DEFAULT_SETTINGS)
-    if not REDIRECT_FILE.exists():
-        REDIRECT_FILE.write_text("100\n")
-    if not FORCE_FILE.exists():
-        FORCE_FILE.write_text("off\n")
-    if not SORT_FILE.exists():
-        SORT_FILE.write_text("module\n")
+    MODULE_BASE_DIR.mkdir(parents=True, exist_ok=True)
+    DATA_BASE_DIR.mkdir(parents=True, exist_ok=True)
 
 def load_settings() -> dict:
     """加载设置"""
     try:
         if SETTINGS_FILE.exists():
             return json.loads(SETTINGS_FILE.read_text())
+        else:
+            return {}
     except:
-        pass
-    return DEFAULT_SETTINGS.copy()
+        return {}
 
 def save_settings(settings: dict):
     """保存设置"""
     SETTINGS_FILE.write_text(json.dumps(settings, indent=2, ensure_ascii=False))
 
-def get_module_path(module_name: str) -> Path:
-    """获取模块文件路径"""
-    return MODULES_DIR / f"{module_name}.json"
+def check_settings_exists() -> bool:
+    """检查配置文件是否存在"""
+    return SETTINGS_FILE.exists()
 
-def load_module(module_name: str) -> dict:
+def load_manifest() -> dict:
+    """加载包清单"""
+    try:
+        if MANIFEST_FILE.exists():
+            return json.loads(MANIFEST_FILE.read_text())
+    except:
+        pass
+    return {"list": []}
+
+def save_manifest(manifest: dict):
+    """保存包清单"""
+    MANIFEST_FILE.write_text(json.dumps(manifest, indent=2, ensure_ascii=False))
+
+def get_module_dir(package_name: str) -> Path:
+    """获取模块目录路径"""
+    return MODULE_BASE_DIR / package_name
+
+def get_module_data_dir(package_name: str) -> Path:
+    """获取模块数据目录路径"""
+    return DATA_BASE_DIR / package_name
+
+def get_module_json_path(package_name: str) -> Path:
+    """获取模块的 module.json 路径"""
+    return get_module_dir(package_name) / "module.json"
+
+def get_function_dir(package_name: str) -> Path:
+    """获取模块的 function 目录路径"""
+    return get_module_dir(package_name) / "function"
+
+def load_module(package_name: str) -> dict:
     """加载模块数据"""
-    module_file = get_module_path(module_name)
-    if not module_file.exists():
+    module_json = get_module_json_path(package_name)
+    if not module_json.exists():
         return {}
     try:
-        return json.loads(module_file.read_text())
+        return json.loads(module_json.read_text())
     except:
         return {}
 
-def save_module(module_name: str, data: dict):
+def save_module(package_name: str, data: dict):
     """保存模块数据"""
-    module_file = get_module_path(module_name)
-    module_file.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    module_dir = get_module_dir(package_name)
+    module_dir.mkdir(parents=True, exist_ok=True)
+    module_json = get_module_json_path(package_name)
+    module_json.write_text(json.dumps(data, indent=2, ensure_ascii=False))
 
-def get_function_dir(module_name: str) -> Path:
-    """获取函数目录"""
-    return FUNCTIONS_BASE_DIR / module_name
+def validate_package_name(name: str) -> bool:
+    """验证包名是否合法"""
+    if not name:
+        return False
+    return all(c.isalnum() or c in ['_', '-', '.'] for c in name)
 
 def safe_basename(path: str) -> str:
     """安全地获取路径的最后一段（basename）"""
@@ -111,57 +143,258 @@ def safe_basename(path: str) -> str:
         return path
     return basename
 
-def validate_subcommand_name(name: str) -> bool:
-    """验证子命令名称是否合法（只允许字母数字和下划线）"""
-    if not name:
-        return False
-    return all(c.isalnum() or c == '_' for c in name)
+def version_compare(v1: str, v2: str) -> int:
+    """
+    比较两个版本号
+    返回: -1 如果 v1 < v2, 0 如果 v1 == v2, 1 如果 v1 > v2
+    支持语义化版本 1.0.0 和数字版本 10001
+    """
+    def parse_version(ver: str) -> Tuple[List[int], List[int]]:
+        if '.' in ver:
+            parts = ver.split('.')
+            numeric_parts = []
+            for p in parts:
+                try:
+                    numeric_parts.append(int(p))
+                except ValueError:
+                    numeric_parts.append(0)
+            return numeric_parts, numeric_parts
+        else:
+            try:
+                num = int(ver)
+                return [num], [num]
+            except ValueError:
+                return [0], [0]
+    
+    parts1, _ = parse_version(v1)
+    parts2, _ = parse_version(v2)
+    
+    max_len = max(len(parts1), len(parts2))
+    parts1 += [0] * (max_len - len(parts1))
+    parts2 += [0] * (max_len - len(parts2))
+    
+    for a, b in zip(parts1, parts2):
+        if a < b:
+            return -1
+        if a > b:
+            return 1
+    
+    return 0
 
-def validate_module_name(name: str) -> bool:
-    """验证模块名称是否合法"""
-    if not name:
-        return False
-    return all(c.isalnum() or c in ['_', '-'] for c in name)
+def format_command_value(value: str) -> str:
+    """格式化命令值显示"""
+    if value.startswith("function."):
+        return value
+    return value
 
 # ============================================================
-# sudo 权限检查和缓存管理
+# 包管理 - 下载和解压
+# ============================================================
+
+def download_file(url: str, dest_path: Path) -> bool:
+    """下载文件到指定路径"""
+    try:
+        print(f"正在下载: {url}")
+        with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
+            tmp_path = Path(tmp_file.name)
+        
+        urllib.request.urlretrieve(url, str(tmp_path))
+        shutil.move(str(tmp_path), str(dest_path))
+        print(f"下载完成: {dest_path}")
+        return True
+    except Exception as e:
+        print(f"下载失败: {e}")
+        if 'tmp_path' in locals() and tmp_path.exists():
+            tmp_path.unlink()
+        return False
+
+def extract_archive(archive_path: Path, dest_dir: Path) -> bool:
+    """解压压缩包到目标目录"""
+    archive_path = Path(archive_path)
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    
+    ext = ''
+    if str(archive_path).endswith('.tar.gz'):
+        ext = '.tar.gz'
+    elif str(archive_path).endswith('.tar'):
+        ext = '.tar'
+    elif str(archive_path).endswith('.zip'):
+        ext = '.zip'
+    elif str(archive_path).endswith('.7z'):
+        ext = '.7z'
+    else:
+        print(f"错误：不支持的压缩格式 '{archive_path}'")
+        return False
+    
+    try:
+        if ext == '.tar.gz':
+            import tarfile
+            with tarfile.open(archive_path, 'r:gz') as tar:
+                tar.extractall(dest_dir)
+        elif ext == '.tar':
+            import tarfile
+            with tarfile.open(archive_path, 'r') as tar:
+                tar.extractall(dest_dir)
+        elif ext == '.zip':
+            import zipfile
+            with zipfile.ZipFile(archive_path, 'r') as zip_ref:
+                zip_ref.extractall(dest_dir)
+        elif ext == '.7z':
+            result = subprocess.run(
+                ['7z', 'x', str(archive_path), f'-o{dest_dir}', '-y'],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode != 0:
+                print(f"7z 解压失败: {result.stderr}")
+                return False
+        else:
+            return False
+        
+        print(f"解压完成: {dest_dir}")
+        return True
+    except Exception as e:
+        print(f"解压失败: {e}")
+        return False
+
+def install_package(package_name: str, archive_url: str) -> bool:
+    """安装包 - 使用覆盖方式更新"""
+    if not validate_package_name(package_name):
+        print(f"错误：无效的包名 '{package_name}'")
+        return False
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        
+        archive_filename = urllib.parse.urlparse(archive_url).path.split('/')[-1]
+        if not archive_filename:
+            archive_filename = f"{package_name}.tar.gz"
+        
+        archive_path = tmp_path / archive_filename
+        if not download_file(archive_url, archive_path):
+            return False
+        
+        extract_dir = tmp_path / "extract"
+        if not extract_archive(archive_path, extract_dir):
+            return False
+        
+        module_json_path = extract_dir / "module.json"
+        if not module_json_path.exists():
+            print(f"错误：压缩包中缺少 module.json 文件")
+            return False
+        
+        try:
+            module_data = json.loads(module_json_path.read_text())
+            if "package" not in module_data or module_data["package"] != package_name:
+                print(f"错误：module.json 中的包名不匹配")
+                return False
+            if "command" not in module_data:
+                print(f"错误：module.json 中缺少 command 字段")
+                return False
+            if "version" not in module_data:
+                print(f"错误：module.json 中缺少 version 字段")
+                return False
+        except json.JSONDecodeError:
+            print(f"错误：module.json 格式无效")
+            return False
+        
+        target_dir = get_module_dir(package_name)
+        if target_dir.exists():
+            response = input(f"包 '{package_name}' 已存在，本次操作会更新它，是否继续 [Y/n]? ")
+            if response.lower() not in ['', 'y', 'yes']:
+                print("已取消安装")
+                return False
+        
+        target_dir.mkdir(parents=True, exist_ok=True)
+        
+        shutil.copy2(module_json_path, target_dir / "module.json")
+        
+        src_function = extract_dir / "function"
+        if src_function.exists() and src_function.is_dir():
+            dst_function = target_dir / "function"
+            if dst_function.exists():
+                shutil.rmtree(dst_function)
+            shutil.copytree(src_function, dst_function)
+            print(f"已更新 function 目录")
+        
+        data_dir = get_module_data_dir(package_name)
+        data_dir.mkdir(parents=True, exist_ok=True)
+        
+        print(f"包 '{package_name}' 安装/更新成功")
+        return True
+
+# ============================================================
+# 扫描函数
+# ============================================================
+
+def scan_bash_functions(script_path: Path) -> List[str]:
+    """扫描 bash 脚本中的所有函数定义"""
+    functions = []
+    try:
+        content = script_path.read_text(errors='ignore')
+        
+        patterns = [
+            r'^([a-zA-Z_][a-zA-Z0-9_]*)\s*\(\s*\)\s*\{',
+            r'^function\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(\s*\)\s*\{',
+            r'^function\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\{',
+        ]
+        
+        for line in content.split('\n'):
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            
+            for pattern in patterns:
+                match = re.match(pattern, line)
+                if match:
+                    func_name = match.group(1)
+                    if func_name not in ['if', 'then', 'else', 'fi', 'for', 'while', 'do', 'done',
+                                        'case', 'esac', 'select', 'until']:
+                        functions.append(func_name)
+                    break
+        
+        seen = set()
+        unique_functions = []
+        for func in functions:
+            if func not in seen:
+                seen.add(func)
+                unique_functions.append(func)
+        
+        return unique_functions
+    except Exception as e:
+        print(f"警告：扫描脚本 '{script_path}' 时出错 - {e}")
+        return []
+
+# ============================================================
+# sudo 权限检查
 # ============================================================
 
 def extract_commands_from_script(script_path: Path) -> Set[str]:
-    """
-    从脚本文件中提取所有可能执行的命令
-    返回命令集合
-    """
+    """从脚本文件中提取所有可能执行的命令"""
     commands = set()
     try:
         content = script_path.read_text(errors='ignore')
         
-        # 提取所有看起来像命令的行（排除注释、变量赋值等）
         for line in content.split('\n'):
             line = line.strip()
-            
-            # 跳过空行、注释、纯变量赋值
-            if not line or line.startswith('#') or '=' in line.split()[0] if line.split() else False:
+            if not line or line.startswith('#') or ('=' in line.split()[0] if line.split() else False):
                 continue
             
-            # 提取命令部分（管道前的第一个命令）
             if '|' in line:
                 parts = line.split('|')
                 first_cmd = parts[0].strip()
             else:
                 first_cmd = line
             
-            # 提取命令名（第一个单词）
             if first_cmd:
                 words = first_cmd.split()
                 if words:
                     cmd = words[0]
-                    # 排除 shell 关键字
-                    if cmd not in ['if', 'then', 'else', 'fi', 'for', 'while', 'do', 'done', 
+                    if cmd not in ['if', 'then', 'else', 'fi', 'for', 'while', 'do', 'done',
                                   'case', 'esac', 'function', '{', '}', '[', ']]', '!']:
                         commands.add(cmd)
         
-        # 额外提取 $(...) 和 `...` 中的命令
         backtick_cmds = re.findall(r'`([^`]+)`', content)
         dollar_cmds = re.findall(r'\$\(([^)]+)\)', content)
         
@@ -169,43 +402,36 @@ def extract_commands_from_script(script_path: Path) -> Set[str]:
             words = cmd_str.strip().split()
             if words and words[0] not in ['if', 'then', 'else', 'fi']:
                 commands.add(words[0])
-                
     except Exception as e:
         print(f"警告：读取脚本 '{script_path}' 时出错 - {e}")
     
     return commands
 
 def rebuild_sudo_cache():
-    """
-    重建 sudo 命令缓存
-    遍历所有函数目录下的脚本，提取所有命令
-    """
+    """重建 sudo 命令缓存"""
     all_commands = set()
     
-    # 遍历所有模块的函数目录
-    for module_dir in FUNCTIONS_BASE_DIR.iterdir():
+    for module_dir in MODULE_BASE_DIR.iterdir():
         if not module_dir.is_dir():
             continue
+        function_dir = module_dir / "function"
+        if not function_dir.exists():
+            continue
         
-        # 遍历目录中的所有脚本文件
-        for script_file in module_dir.iterdir():
-            if script_file.is_file() and script_file.suffix in ['.sh', '.bash', '.py', '.pl', '' ]:
-                # 检查文件是否有可执行权限或者是脚本文件
+        for script_file in function_dir.iterdir():
+            if script_file.is_file() and script_file.suffix in ['.sh', '.bash', '.py', '.pl', '']:
                 if script_file.stat().st_mode & 0o111 or script_file.suffix in ['.sh', '.bash']:
                     commands = extract_commands_from_script(script_file)
                     all_commands.update(commands)
     
-    # 写入缓存文件
     sorted_commands = sorted(all_commands)
     SUDO_CACHE_FILE.write_text('\n'.join(sorted_commands) + '\n')
-    
     return all_commands
 
 def load_sudo_cache() -> Set[str]:
     """加载 sudo 命令缓存"""
     if not SUDO_CACHE_FILE.exists():
         return set()
-    
     try:
         content = SUDO_CACHE_FILE.read_text().strip()
         if not content:
@@ -215,40 +441,28 @@ def load_sudo_cache() -> Set[str]:
         return set()
 
 def get_sudo_allowed_commands() -> Set[str]:
-    """
-    通过 sudo -l --json 获取当前用户被允许的 sudo 命令
-    返回命令集合
-    """
+    """获取当前用户被允许的 sudo 命令"""
     allowed_commands = set()
-    
     try:
-        # 执行 sudo -l --json
         result = subprocess.run(
             ['sudo', '-l', '--json'],
             capture_output=True,
             text=True,
             timeout=30
         )
-        
         if result.returncode != 0:
-            print(f"警告：无法获取 sudo 权限信息 - {result.stderr.strip()}")
             return allowed_commands
         
-        # 解析 JSON 输出
         try:
             sudo_data = json.loads(result.stdout)
         except json.JSONDecodeError:
-            print("警告：sudo -l --json 输出不是有效的 JSON")
             return allowed_commands
         
-        # 从 JSON 中提取命令
-        # sudo -l --json 的输出结构可能因系统而异，我们处理常见的格式
         def extract_commands_from_json(data, commands_set):
             if isinstance(data, dict):
                 for key, value in data.items():
                     if key in ['command', 'commands']:
                         if isinstance(value, str):
-                            # 单个命令
                             cmd = value.split()[0] if value.split() else ''
                             if cmd:
                                 commands_set.add(cmd)
@@ -267,49 +481,27 @@ def get_sudo_allowed_commands() -> Set[str]:
                     extract_commands_from_json(item, commands_set)
         
         extract_commands_from_json(sudo_data, allowed_commands)
-        
-    except subprocess.TimeoutExpired:
-        print("警告：获取 sudo 权限信息超时")
-    except FileNotFoundError:
-        print("警告：sudo 命令不可用")
-    except Exception as e:
-        print(f"警告：获取 sudo 权限信息时出错 - {e}")
-    
+    except:
+        pass
     return allowed_commands
 
-def check_sudo_violations():
-    """
-    检查 sudo 权限违规
-    比较缓存中的命令和 sudo -l --json 中的命令
-    返回违规命令列表
-    """
-    # 加载缓存中的命令
+def check_sudo_violations() -> List[str]:
+    """检查 sudo 权限违规"""
     cached_commands = load_sudo_cache()
-    
-    # 获取 sudo 允许的命令
     sudo_commands = get_sudo_allowed_commands()
-    
     if not sudo_commands:
-        # 无法获取 sudo 信息，跳过检查
         return []
-    
-    # 找出 sudo 中有但缓存中没有的命令（潜在越权）
     violations = sudo_commands - cached_commands
-    
     return sorted(violations)
 
 def handle_sudo_violations(violations: List[str], operation_desc: str = ""):
-    """
-    处理 sudo 权限违规
-    根据 force 模式采取不同措施
-    """
+    """处理 sudo 权限违规"""
     if not violations:
         return True
     
     settings = load_settings()
     force_mode = settings.get("force", "off")
     
-    # 在 off 模式下，完全跳过检查
     if force_mode == "off":
         return True
     
@@ -318,38 +510,41 @@ def handle_sudo_violations(violations: List[str], operation_desc: str = ""):
         violation_msg += f"  - {cmd}\n"
     
     if force_mode == "true":
-        # 严格模式：直接退出
         print(f"错误：检测到 sudo 配置中存在未授权的命令！")
         print(violation_msg)
         print("程序已终止，请联系管理员审查 sudo 配置。")
         return False
-    
     elif force_mode == "false":
-        # 宽容模式：记录日志
         log_entry = f"[{datetime.now().isoformat()}] {operation_desc}\n"
         log_entry += f"发现潜在的越权 sudo 命令:\n"
         for cmd in violations:
             log_entry += f"  {cmd}\n"
         log_entry += "\n"
-        
         with open(VIOLATIONS_LOG, "a") as f:
             f.write(log_entry)
-        
         print(f"警告：检测到 sudo 配置变更！")
         print(violation_msg)
         print(f"已记录到日志文件: {VIOLATIONS_LOG}")
         return True
-    
-    else:  # off
-        # 关闭模式：跳过检查
+    else:
         return True
 
 # ============================================================
 # 命令解析和执行
 # ============================================================
 
-def resolve_command(module_name: str, subcommand: str, depth: int = 0, max_depth: Optional[int] = None) -> Optional[str]:
-    """解析命令别名链，返回最终的实际命令引用"""
+def get_commands_from_module(module_data: dict) -> Dict[str, str]:
+    """从模块数据中提取命令映射"""
+    commands = {}
+    if "command" in module_data and isinstance(module_data["command"], list):
+        for item in module_data["command"]:
+            if isinstance(item, dict):
+                for key, value in item.items():
+                    commands[key] = value
+    return commands
+
+def resolve_command(package_name: str, subcommand: str, depth: int = 0, max_depth: Optional[int] = None) -> Optional[str]:
+    """解析命令别名链，返回最终的命令值"""
     if max_depth is None:
         settings = load_settings()
         max_depth = settings.get("redirect", 100)
@@ -361,37 +556,35 @@ def resolve_command(module_name: str, subcommand: str, depth: int = 0, max_depth
         print(f"警告：别名追踪深度超过限制 ({max_depth})，可能存在循环引用")
         return None
     
-    module_data = load_module(module_name)
-    if subcommand not in module_data:
+    module_data = load_module(package_name)
+    if not module_data:
         return None
     
-    value = module_data[subcommand]
+    commands = get_commands_from_module(module_data)
+    if subcommand not in commands:
+        return None
     
-    # 如果是函数调用，直接返回
-    if isinstance(value, str) and value.startswith("function."):
+    value = commands[subcommand]
+    
+    if value.startswith("function."):
         return value
     
-    # 如果是别名（指向同模块内的另一个子命令）
-    if isinstance(value, str) and value in module_data:
-        return resolve_command(module_name, value, depth + 1, max_depth)
+    if value in commands:
+        return resolve_command(package_name, value, depth + 1, max_depth)
     
-    # 如果值是别名但指向的子命令不存在，返回 None
-    if isinstance(value, str) and not value.startswith("function."):
-        if value not in module_data:
-            print(f"错误：别名 '{value}' 指向的子命令不存在")
-            return None
-    
-    return value
+    if value in commands:
+        return value
+    else:
+        print(f"错误：别名 '{value}' 指向的子命令不存在")
+        return None
 
-def execute_function(function_ref: str) -> int:
+def execute_function(function_ref: str, args: Optional[List[str]] = None, package_name: Optional[str] = None) -> int:
     """
     执行函数调用
-    格式: function.文件名(函数名) 或 function.文件名
+    格式: function.文件名.sh 或 function.文件名.sh(函数名)
     """
-    # 解析函数引用
     ref = function_ref[len("function."):]
     
-    # 检查是否有括号参数
     func_name = None
     if '(' in ref and ref.endswith(')'):
         paren_idx = ref.index('(')
@@ -400,122 +593,343 @@ def execute_function(function_ref: str) -> int:
     else:
         file_part = ref
     
-    # 查找函数文件
     found = False
     executed_cmd = None
+    found_package = None
     
-    for module_dir in FUNCTIONS_BASE_DIR.iterdir():
-        if not module_dir.is_dir():
-            continue
-        
-        # 尝试不带后缀的文件名
-        script_path = module_dir / file_part
-        if script_path.exists() and script_path.is_file():
-            found = True
-            executed_cmd = str(script_path)
-            break
-        
-        # 尝试带 .sh 后缀
-        script_path_sh = module_dir / f"{file_part}.sh"
-        if script_path_sh.exists() and script_path_sh.is_file():
-            found = True
-            executed_cmd = str(script_path_sh)
-            break
+    if package_name:
+        function_dir = get_function_dir(package_name)
+        if function_dir.exists():
+            script_path = function_dir / file_part
+            if script_path.exists() and script_path.is_file():
+                found = True
+                executed_cmd = str(script_path)
+                found_package = package_name
+            else:
+                script_path_sh = function_dir / f"{file_part}.sh"
+                if script_path_sh.exists() and script_path_sh.is_file():
+                    found = True
+                    executed_cmd = str(script_path_sh)
+                    found_package = package_name
+    
+    if not found:
+        for module_dir in MODULE_BASE_DIR.iterdir():
+            if not module_dir.is_dir():
+                continue
+            function_dir = module_dir / "function"
+            if not function_dir.exists():
+                continue
+            
+            script_path = function_dir / file_part
+            if script_path.exists() and script_path.is_file():
+                found = True
+                executed_cmd = str(script_path)
+                found_package = module_dir.name
+                break
+            
+            script_path_sh = function_dir / f"{file_part}.sh"
+            if script_path_sh.exists() and script_path_sh.is_file():
+                found = True
+                executed_cmd = str(script_path_sh)
+                found_package = module_dir.name
+                break
     
     if not found:
         print(f"错误：找不到函数文件 '{file_part}'")
         return 1
     
-    # 构建执行命令
+    settings = load_settings()
+    shell_path = settings.get("shell", "")
+    
+    env = os.environ.copy()
+    if found_package:
+        env['MODULE_NAME'] = found_package
+        env['MODULE_DIR'] = str(get_module_dir(found_package))
+        env['MODULE_DATA_DIR'] = str(get_module_data_dir(found_package))
+    
+    cwd = get_module_dir(found_package) if found_package else None
+    if cwd and not cwd.exists():
+        cwd = None
+    
     if func_name:
-        # 执行特定函数
-        shell_cmd = f"source '{executed_cmd}' && {func_name}"
-        result = subprocess.run(
-            ["bash", "-c", shell_cmd],
-            capture_output=False,
-            text=True
-        )
+        if shell_path:
+            shell_cmd = f"source '{executed_cmd}' && {func_name}"
+            if args:
+                quoted_args = ' '.join(shlex.quote(arg) for arg in args)
+                shell_cmd += f" {quoted_args}"
+            result = subprocess.run(
+                [shell_path, "-c", shell_cmd],
+                capture_output=False,
+                text=True,
+                env=env,
+                cwd=cwd
+            )
+        else:
+            shell_cmd = f"source '{executed_cmd}' && {func_name}"
+            if args:
+                quoted_args = ' '.join(shlex.quote(arg) for arg in args)
+                shell_cmd += f" {quoted_args}"
+            result = subprocess.run(
+                ["bash", "-c", shell_cmd],
+                capture_output=False,
+                text=True,
+                env=env,
+                cwd=cwd
+            )
         return result.returncode
     else:
-        # 直接执行脚本文件
+        if shell_path:
+            cmd = [shell_path, executed_cmd]
+        else:
+            cmd = ["bash", executed_cmd]
+        if args:
+            cmd.extend(args)
         result = subprocess.run(
-            ["bash", executed_cmd],
+            cmd,
             capture_output=False,
-            text=True
+            text=True,
+            env=env,
+            cwd=cwd
         )
         return result.returncode
+
+def cmd_execute(package_name: str, subcommand: str, args: Optional[List[str]] = None) -> int:
+    """执行子命令"""
+    if not check_settings_exists():
+        print("错误：未初始化，请先执行 'sercli init'")
+        return 1
+    
+    env = os.environ.copy()
+    env['MODULE_NAME'] = package_name
+    env['MODULE_DIR'] = str(get_module_dir(package_name))
+    env['MODULE_DATA_DIR'] = str(get_module_data_dir(package_name))
+    
+    settings = load_settings()
+    max_redirect = settings.get("redirect", 100)
+    
+    resolved = resolve_command(package_name, subcommand, max_depth=max_redirect if max_redirect > 0 else None)
+    
+    if resolved is None:
+        print(f"错误：找不到命令 '{package_name}.{subcommand}'")
+        return 1
+    
+    if resolved.startswith("function."):
+        return execute_function(resolved, args, package_name)
+    
+    cmd_parts = shlex.split(resolved)
+    if args:
+        cmd_parts.extend(args)
+    
+    cwd = get_module_dir(package_name)
+    if not cwd.exists():
+        cwd = None
+    
+    result = subprocess.run(
+        cmd_parts,
+        capture_output=False,
+        text=True,
+        env=env,
+        cwd=cwd
+    )
+    return result.returncode
 
 # ============================================================
 # 核心命令处理
 # ============================================================
 
-def cmd_create_module(module_name: str):
+def cmd_init():
+    """初始化 sercli 配置 - 交互式"""
+    if check_settings_exists():
+        response = input("配置文件已存在，是否覆盖 [y/N]? ")
+        if response.lower() not in ['y', 'yes']:
+            print("已取消初始化")
+            return 1
+    
+    ensure_config_dirs()
+    
+    print("\n=== sercli 初始化配置 ===\n")
+    print("提示：直接按回车使用默认值\n")
+    
+    current_settings = load_settings() if check_settings_exists() else {}
+    
+    # 1. 仓库地址
+    default_repo = current_settings.get("repo", DEFAULT_SETTINGS["repo"])
+    repo_input = input(f"中心服务器地址 (默认: {default_repo or '空'}): ").strip()
+    repo_url = repo_input if repo_input else default_repo
+    
+    # 2. 重定向限制
+    default_redirect = current_settings.get("redirect", DEFAULT_SETTINGS["redirect"])
+    redirect_input = input(f"重定向限制 (默认: {default_redirect}): ").strip()
+    try:
+        redirect_value = int(redirect_input) if redirect_input else default_redirect
+        if redirect_value < 0:
+            print("警告：重定向数值不能为负数，将使用默认值")
+            redirect_value = default_redirect
+    except ValueError:
+        print(f"警告：无效的数值，将使用默认值 {default_redirect}")
+        redirect_value = default_redirect
+    
+    # 3. 严格模式
+    default_force = current_settings.get("force", DEFAULT_SETTINGS["force"])
+    force_options = {"true": "严格模式", "false": "宽容模式", "off": "完全关闭"}
+    force_input = input(f"严格模式 (true/false/off, 默认: {default_force}): ").strip().lower()
+    if force_input in ["true", "false", "off"]:
+        force_mode = force_input
+    else:
+        print(f"警告：无效的严格模式，将使用默认值 '{default_force}'")
+        force_mode = default_force
+    
+    # 4. 调用顺序
+    default_sort = current_settings.get("sort", DEFAULT_SETTINGS["sort"])
+    sort_input = input(f"调用顺序 (module/command, 默认: {default_sort}): ").strip().lower()
+    if sort_input in ["module", "command"]:
+        sort_mode = sort_input
+    else:
+        print(f"警告：无效的调用顺序，将使用默认值 '{default_sort}'")
+        sort_mode = default_sort
+    
+    # 5. Shell 解释器
+    default_shell = current_settings.get("shell", DEFAULT_SETTINGS["shell"])
+    shell_input = input(f"Shell 解释器路径 (默认: {default_shell or 'bash'}): ").strip()
+    shell_path = shell_input if shell_input else default_shell
+    
+    if shell_path:
+        path_obj = Path(shell_path).expanduser().resolve()
+        if not path_obj.exists():
+            print(f"警告：路径 '{shell_path}' 不存在")
+            use_anyway = input("是否继续使用该路径 [y/N]? ").strip().lower()
+            if use_anyway not in ['y', 'yes']:
+                shell_path = default_shell
+        elif not path_obj.is_file():
+            print(f"警告：'{shell_path}' 不是一个文件")
+            use_anyway = input("是否继续使用该路径 [y/N]? ").strip().lower()
+            if use_anyway not in ['y', 'yes']:
+                shell_path = default_shell
+    
+    print("\n=== 配置摘要 ===")
+    print(f"  仓库地址: {repo_url or '(未设置)'}")
+    print(f"  重定向限制: {redirect_value}")
+    print(f"  严格模式: {force_mode} ({force_options.get(force_mode, '未知')})")
+    print(f"  调用顺序: {sort_mode}")
+    print(f"  Shell 解释器: {shell_path or 'bash (默认)'}")
+    
+    print("\n是否保存以上配置?")
+    confirm = input("[Y/n]: ").strip().lower()
+    if confirm not in ['', 'y', 'yes']:
+        print("已取消初始化")
+        return 1
+    
+    settings = {
+        "repo": repo_url,
+        "redirect": redirect_value,
+        "force": force_mode,
+        "sort": sort_mode,
+        "shell": shell_path
+    }
+    save_settings(settings)
+    
+    print(f"\n✅ 初始化成功！配置文件已保存: {SETTINGS_FILE}")
+    print("\n接下来你可以:")
+    print("  - 使用 'sercli create mod <模块名>' 创建模块")
+    print("  - 使用 'sercli add <包名>' 安装远程包")
+    print("  - 使用 'sercli set repo <URL>' 重新设置仓库地址")
+    
+    return 0
+def cmd_create_module(package_name: str):
     """创建模块"""
-    if not validate_module_name(module_name):
-        print(f"错误：无效的模块名 '{module_name}'，只允许字母、数字、下划线和连字符")
+    if not check_settings_exists():
+        print("错误：未初始化，请先执行 'sercli init'")
         return 1
     
-    module_file = get_module_path(module_name)
-    if module_file.exists():
-        print(f"错误：模块 '{module_name}' 已存在")
+    if not validate_package_name(package_name):
+        print(f"错误：无效的包名 '{package_name}'")
         return 1
     
-    save_module(module_name, {})
-    func_dir = get_function_dir(module_name)
-    func_dir.mkdir(parents=True, exist_ok=True)
+    module_json = get_module_json_path(package_name)
+    if module_json.exists():
+        print(f"错误：模块 '{package_name}' 已存在")
+        return 1
     
-    print(f"成功创建模块 '{module_name}'")
+    module_data = {
+        "source": "local",
+        "package": package_name,
+        "version": "0.0.1",
+        "command": []
+    }
+    
+    save_module(package_name, module_data)
+    
+    data_dir = get_module_data_dir(package_name)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    
+    print(f"成功创建模块 '{package_name}'")
     return 0
 
-def cmd_delete_module(module_name: str):
+def cmd_delete_module(package_name: str):
     """删除模块"""
-    module_file = get_module_path(module_name)
-    if not module_file.exists():
-        print(f"错误：模块 '{module_name}' 不存在")
+    if not check_settings_exists():
+        print("错误：未初始化，请先执行 'sercli init'")
         return 1
     
-    module_file.unlink()
-    func_dir = get_function_dir(module_name)
-    if func_dir.exists():
-        shutil.rmtree(func_dir)
+    module_dir = get_module_dir(package_name)
+    if not module_dir.exists():
+        print(f"错误：模块 '{package_name}' 不存在")
+        return 1
     
-    # 只在 force 模式不为 off 时重建缓存
+    data_dir = get_module_data_dir(package_name)
+    if data_dir.exists() and any(data_dir.iterdir()):
+        response = input(f"模块 '{package_name}' 的数据目录 '{data_dir}' 非空，是否一并删除 [y/N]? ")
+        if response.lower() in ['y', 'yes']:
+            shutil.rmtree(data_dir)
+            print(f"已删除数据目录: {data_dir}")
+        else:
+            print(f"保留数据目录: {data_dir}")
+    
+    shutil.rmtree(module_dir)
+    
     settings = load_settings()
     force_mode = settings.get("force", "off")
     if force_mode != "off":
         rebuild_sudo_cache()
     
-    print(f"成功删除模块 '{module_name}'")
+    print(f"成功删除模块 '{package_name}'")
     return 0
 
-def cmd_set_command(module_name: str, subcommand: str, value: str):
-    """设置子命令 - 仅支持别名和function调用"""
-    if not validate_subcommand_name(subcommand):
-        print(f"错误：无效的子命令名 '{subcommand}'，只允许字母、数字和下划线")
+def cmd_set_command(package_name: str, subcommand: str, value: str):
+    """设置子命令"""
+    if not check_settings_exists():
+        print("错误：未初始化，请先执行 'sercli init'")
         return 1
     
-    module_data = load_module(module_name)
-    if not module_data and not Path(get_module_path(module_name)).exists():
-        print(f"错误：模块 '{module_name}' 不存在，请先创建模块")
+    if not subcommand:
+        print("错误：子命令名不能为空")
         return 1
     
-    # 处理 NULL 情况 - 删除子命令
+    module_data = load_module(package_name)
+    if not module_data:
+        print(f"错误：模块 '{package_name}' 不存在")
+        return 1
+    
     if value.upper() == "NULL":
-        if subcommand in module_data:
-            del module_data[subcommand]
-            save_module(module_name, module_data)
-            print(f"已删除子命令 '{module_name}.{subcommand}'")
+        commands = get_commands_from_module(module_data)
+        if subcommand in commands:
+            module_data["command"] = [item for item in module_data["command"] if subcommand not in item]
+            save_module(package_name, module_data)
+            print(f"已删除子命令 '{package_name}.{subcommand}'")
         else:
-            print(f"子命令 '{module_name}.{subcommand}' 不存在")
+            print(f"子命令 '{package_name}.{subcommand}' 不存在")
         return 0
     
-    # 处理 function 调用
+    source = module_data.get("source", "local")
+    if source == "repo":
+        module_data["source"] = "noupdate"
+        print(f"注意：模块 '{package_name}' 来源为 repo，修改后已变为 noupdate 状态")
+    
     if value.startswith("function."):
-        # 验证 function 引用格式
         ref = value[len("function."):]
         if '(' in ref:
             if not ref.endswith(')'):
-                print(f"错误：无效的 function 引用格式 '{value}'，应为 function.文件名(函数名)")
+                print(f"错误：无效的 function 引用格式 '{value}'")
                 return 1
             file_part = ref[:ref.index('(')]
             func_part = ref[ref.index('(')+1:-1]
@@ -526,54 +940,54 @@ def cmd_set_command(module_name: str, subcommand: str, value: str):
             if not ref:
                 print(f"错误：无效的 function 引用格式 '{value}'")
                 return 1
-        
-        module_data[subcommand] = value
-        save_module(module_name, module_data)
-        print(f"成功设置函数调用: '{module_name}.{subcommand}' = '{value}'")
-        return 0
     
-    # 处理别名（必须是同模块内的子命令）
-    if value in module_data:
-        module_data[subcommand] = value
-        save_module(module_name, module_data)
-        print(f"成功设置别名: '{module_name}.{subcommand}' → '{module_name}.{value}'")
-        return 0
+    commands = get_commands_from_module(module_data)
+    found = False
+    for i, item in enumerate(module_data["command"]):
+        if subcommand in item:
+            module_data["command"][i] = {subcommand: value}
+            found = True
+            break
     
-    # 如果既不是 function 也不是别名，报错
-    print(f"错误：'{value}' 不是有效的 function 引用或模块内的子命令")
-    print("提示：要设置系统命令，请先创建一个包含命令的脚本文件")
-    print(f"      然后使用 'sercli import function {module_name} {subcommand}=<脚本路径>' 导入")
-    return 1
-
-def cmd_delete_command(module_name: str, subcommand: str):
-    """删除子命令"""
-    module_data = load_module(module_name)
-    if not module_data:
-        print(f"错误：模块 '{module_name}' 不存在")
-        return 1
+    if not found:
+        module_data["command"].append({subcommand: value})
     
-    if subcommand not in module_data:
-        print(f"错误：子命令 '{module_name}.{subcommand}' 不存在")
-        return 1
-    
-    del module_data[subcommand]
-    save_module(module_name, module_data)
-    print(f"成功删除子命令 '{module_name}.{subcommand}'")
+    save_module(package_name, module_data)
+    print(f"成功设置子命令: '{package_name}.{subcommand}' = '{value}'")
     return 0
 
-def cmd_import_function(module_name: str, subcommand: str, script_path: str):
-    """导入函数脚本到模块的函数目录"""
-    if not validate_subcommand_name(subcommand):
-        print(f"错误：无效的子命令名 '{subcommand}'，只允许字母、数字和下划线")
+def cmd_delete_command(package_name: str, subcommand: str):
+    """删除子命令"""
+    if not check_settings_exists():
+        print("错误：未初始化，请先执行 'sercli init'")
         return 1
     
-    # 检查模块是否存在
-    module_data = load_module(module_name)
-    if not module_data and not Path(get_module_path(module_name)).exists():
-        print(f"错误：模块 '{module_name}' 不存在，请先创建模块")
+    module_data = load_module(package_name)
+    if not module_data:
+        print(f"错误：模块 '{package_name}' 不存在")
         return 1
     
-    # 检查源脚本是否存在
+    commands = get_commands_from_module(module_data)
+    if subcommand not in commands:
+        print(f"错误：子命令 '{package_name}.{subcommand}' 不存在")
+        return 1
+    
+    module_data["command"] = [item for item in module_data["command"] if subcommand not in item]
+    save_module(package_name, module_data)
+    print(f"成功删除子命令 '{package_name}.{subcommand}'")
+    return 0
+
+def cmd_import_sh(package_name: str, script_path: str, auto_create: bool = True):
+    """导入整个 shell 脚本"""
+    if not check_settings_exists():
+        print("错误：未初始化，请先执行 'sercli init'")
+        return 1
+    
+    module_data = load_module(package_name)
+    if not module_data:
+        print(f"错误：模块 '{package_name}' 不存在")
+        return 1
+    
     source_path = Path(script_path).expanduser().resolve()
     if not source_path.exists():
         print(f"错误：找不到脚本文件 '{script_path}'")
@@ -583,70 +997,136 @@ def cmd_import_function(module_name: str, subcommand: str, script_path: str):
         print(f"错误：'{script_path}' 不是一个文件")
         return 1
     
-    # 目标路径
-    func_dir = get_function_dir(module_name)
-    func_dir.mkdir(parents=True, exist_ok=True)
+    function_dir = get_function_dir(package_name)
+    function_dir.mkdir(parents=True, exist_ok=True)
+    target_name = source_path.name
+    target_path = function_dir / target_name
     
-    # 确定目标文件名
-    target_name = subcommand
-    if source_path.suffix:
-        target_name = f"{subcommand}{source_path.suffix}"
+    if target_path.exists():
+        print(f"警告：目标文件已存在，将被覆盖: {target_path}")
     
-    target_path = func_dir / target_name
-    
-    # 复制脚本
     try:
         shutil.copy2(source_path, target_path)
-        # 确保可执行
         target_path.chmod(target_path.stat().st_mode | 0o111)
     except Exception as e:
         print(f"错误：复制脚本失败 - {e}")
         return 1
     
-    # 自动设置 function 引用
-    module_data[subcommand] = f"function.{target_name}"
-    save_module(module_name, module_data)
+    print(f"成功导入脚本: '{source_path}' → '{target_path}'")
     
-    # 只在 force 模式不为 off 时重建缓存和检查
+    if auto_create:
+        functions = scan_bash_functions(target_path)
+        if functions:
+            print(f"发现 {len(functions)} 个函数:")
+            for func in functions:
+                print(f"  - {func}")
+            
+            commands = get_commands_from_module(module_data)
+            created_count = 0
+            for func in functions:
+                if func in commands:
+                    print(f"  跳过 '{func}' (已存在)")
+                    continue
+                if module_data.get("source") == "repo":
+                    module_data["source"] = "noupdate"
+                    print(f"注意：模块 '{package_name}' 来源为 repo，修改后已变为 noupdate 状态")
+                module_data["command"].append({func: f"function.{target_name}({func})"})
+                created_count += 1
+            
+            if created_count > 0:
+                save_module(package_name, module_data)
+                print(f"成功创建 {created_count} 个子命令")
+            else:
+                print("没有新的子命令需要创建")
+        else:
+            print("警告：未在脚本中发现任何函数定义")
+    else:
+        print("已跳过自动创建子命令（--nocmd 模式）")
+    
     settings = load_settings()
     force_mode = settings.get("force", "off")
-    
     if force_mode != "off":
         print("正在重建 sudo 命令缓存...")
         rebuild_sudo_cache()
-        
-        # 检查 sudo 违规
         violations = check_sudo_violations()
-        if not handle_sudo_violations(violations, f"导入脚本 {script_path} 到模块 {module_name}"):
+        if not handle_sudo_violations(violations, f"导入脚本 {script_path} 到模块 {package_name}"):
             return 1
     
-    print(f"成功导入脚本: '{script_path}' → '{target_path}'")
-    print(f"自动设置命令: '{module_name}.{subcommand}' = 'function.{target_name}'")
     return 0
 
-def cmd_set_module_link(module_name: str, link_name: str):
-    """设置模块链接名"""
-    if not validate_module_name(link_name):
-        print(f"错误：无效的链接名 '{link_name}'，只允许字母、数字、下划线和连字符")
+def cmd_import_cmd(package_name: str, subcommand: str, script_path: str):
+    """导入单个命令脚本"""
+    if not check_settings_exists():
+        print("错误：未初始化，请先执行 'sercli init'")
         return 1
     
-    module_data = load_module(module_name)
-    if not module_data and not Path(get_module_path(module_name)).exists():
-        print(f"错误：模块 '{module_name}' 不存在")
+    if not subcommand:
+        print("错误：子命令名不能为空")
         return 1
     
-    module_data["__link__"] = link_name
-    save_module(module_name, module_data)
-    print(f"成功设置模块 '{module_name}' 的链接名为 '{link_name}'")
+    module_data = load_module(package_name)
+    if not module_data:
+        print(f"错误：模块 '{package_name}' 不存在")
+        return 1
+    
+    source_path = Path(script_path).expanduser().resolve()
+    if not source_path.exists():
+        print(f"错误：找不到脚本文件 '{script_path}'")
+        return 1
+    
+    if not source_path.is_file():
+        print(f"错误：'{script_path}' 不是一个文件")
+        return 1
+    
+    function_dir = get_function_dir(package_name)
+    function_dir.mkdir(parents=True, exist_ok=True)
+    
+    target_name = subcommand
+    if source_path.suffix:
+        target_name = f"{subcommand}{source_path.suffix}"
+    
+    target_path = function_dir / target_name
+    
+    if target_path.exists():
+        print(f"警告：目标文件已存在，将被覆盖: {target_path}")
+    
+    try:
+        shutil.copy2(source_path, target_path)
+        target_path.chmod(target_path.stat().st_mode | 0o111)
+    except Exception as e:
+        print(f"错误：复制脚本失败 - {e}")
+        return 1
+    
+    if module_data.get("source") == "repo":
+        module_data["source"] = "noupdate"
+        print(f"注意：模块 '{package_name}' 来源为 repo，修改后已变为 noupdate 状态")
+    
+    module_data["command"].append({subcommand: f"function.{target_name}"})
+    save_module(package_name, module_data)
+    
+    print(f"成功导入脚本: '{source_path}' → '{target_path}'")
+    print(f"自动设置命令: '{package_name}.{subcommand}' = 'function.{target_name}'")
+    
+    settings = load_settings()
+    force_mode = settings.get("force", "off")
+    if force_mode != "off":
+        print("正在重建 sudo 命令缓存...")
+        rebuild_sudo_cache()
+        violations = check_sudo_violations()
+        if not handle_sudo_violations(violations, f"导入脚本 {script_path} 到模块 {package_name}"):
+            return 1
+    
     return 0
 
 def cmd_set_sort(mode: str):
     """设置调用顺序偏好"""
-    if mode not in ["module", "command"]:
-        print(f"错误：无效的排序模式 '{mode}'，可选值为 'module' 或 'command'")
+    if not check_settings_exists():
+        print("错误：未初始化，请先执行 'sercli init'")
         return 1
     
-    SORT_FILE.write_text(f"{mode}\n")
+    if mode not in ["module", "command"]:
+        print(f"错误：无效的排序模式 '{mode}'")
+        return 1
     settings = load_settings()
     settings["sort"] = mode
     save_settings(settings)
@@ -655,20 +1135,21 @@ def cmd_set_sort(mode: str):
 
 def cmd_set_redirect(value: str):
     """设置重定向限制"""
+    if not check_settings_exists():
+        print("错误：未初始化，请先执行 'sercli init'")
+        return 1
+    
     if value.upper() == "NULL":
-        REDIRECT_FILE.write_text("-1\n")
         settings = load_settings()
         settings["redirect"] = -1
         save_settings(settings)
         print("已取消重定向限制")
         return 0
-    
     try:
         num = int(value)
         if num < 0:
             print("错误：重定向数值不能为负数")
             return 1
-        REDIRECT_FILE.write_text(f"{num}\n")
         settings = load_settings()
         settings["redirect"] = num
         save_settings(settings)
@@ -680,46 +1161,88 @@ def cmd_set_redirect(value: str):
 
 def cmd_set_force(mode: str):
     """设置严格模式"""
-    if mode not in ["true", "false", "off"]:
-        print(f"错误：无效的严格模式 '{mode}'，可选值为 'true', 'false', 'off'")
+    if not check_settings_exists():
+        print("错误：未初始化，请先执行 'sercli init'")
         return 1
     
-    FORCE_FILE.write_text(f"{mode}\n")
+    if mode not in ["true", "false", "off"]:
+        print(f"错误：无效的严格模式 '{mode}'")
+        return 1
     settings = load_settings()
     settings["force"] = mode
     save_settings(settings)
-    
     mode_names = {"true": "严格模式", "false": "宽容模式", "off": "完全关闭"}
     print(f"已设置为{mode_names[mode]}")
-    
-    # 切换到严格或宽容模式时立即检查一次
     if mode in ["true", "false"]:
         violations = check_sudo_violations()
         if violations:
             print(f"\n当前 sudo 配置状态检查:")
             handle_sudo_violations(violations, "切换 force 模式")
+    return 0
+
+def cmd_set_shell(shell_path: str):
+    """设置 shell 解释器路径"""
+    if not check_settings_exists():
+        print("错误：未初始化，请先执行 'sercli init'")
+        return 1
     
+    if shell_path.upper() == "NULL":
+        settings = load_settings()
+        settings["shell"] = ""
+        save_settings(settings)
+        print("已清除 shell 解释器设置，将使用默认的 bash")
+        return 0
+    
+    path_obj = Path(shell_path).expanduser().resolve()
+    if not path_obj.exists():
+        print(f"警告：路径 '{shell_path}' 不存在")
+        response = input("是否继续设置 [y/N]? ")
+        if response.lower() not in ['y', 'yes']:
+            print("已取消设置")
+            return 1
+    elif not path_obj.is_file():
+        print(f"错误：'{shell_path}' 不是一个文件")
+        return 1
+    elif not os.access(str(path_obj), os.X_OK):
+        print(f"错误：'{shell_path}' 没有执行权限")
+        return 1
+    
+    settings = load_settings()
+    settings["shell"] = str(path_obj)
+    save_settings(settings)
+    print(f"成功设置 shell 解释器: {path_obj}")
+    return 0
+
+def cmd_set_repo(repo_url: str):
+    """设置中心服务器地址"""
+    if not check_settings_exists():
+        print("错误：未初始化，请先执行 'sercli init'")
+        return 1
+    
+    settings = load_settings()
+    settings["repo"] = repo_url
+    save_settings(settings)
+    print(f"已设置仓库地址: {repo_url}")
     return 0
 
 def cmd_check_sudo():
     """手动检查 sudo 配置"""
-    print("正在检查 sudo 配置...")
+    if not check_settings_exists():
+        print("错误：未初始化，请先执行 'sercli init'")
+        return 1
     
-    # 加载缓存
+    print("正在检查 sudo 配置...")
     cached = load_sudo_cache()
     print(f"缓存中的命令数: {len(cached)}")
-    
-    # 获取 sudo 允许的命令
     sudo_cmds = get_sudo_allowed_commands()
-    print(f"sud o 允许的命令数: {len(sudo_cmds)}")
+    print(f"sudo 允许的命令数: {len(sudo_cmds)}")
     
-    # 找出差异
     only_in_sudo = sudo_cmds - cached
     only_in_cache = cached - sudo_cmds
     
     if only_in_sudo:
         print(f"\n⚠️ 发现 {len(only_in_sudo)} 个 sudo 中有但缓存中没有的命令:")
-        for cmd in sorted(only_in_sudo)[:10]:  # 最多显示10个
+        for cmd in sorted(only_in_sudo)[:10]:
             print(f"  - {cmd}")
         if len(only_in_sudo) > 10:
             print(f"  ... 还有 {len(only_in_sudo) - 10} 个")
@@ -734,11 +1257,14 @@ def cmd_check_sudo():
 
 def cmd_rebuild_cache():
     """手动重建缓存"""
+    if not check_settings_exists():
+        print("错误：未初始化，请先执行 'sercli init'")
+        return 1
+    
     print("正在重建 sudo 命令缓存...")
     commands = rebuild_sudo_cache()
     print(f"缓存已重建，共 {len(commands)} 个命令")
     
-    # 只在 force 模式不为 off 时检查违规
     settings = load_settings()
     force_mode = settings.get("force", "off")
     if force_mode != "off":
@@ -749,28 +1275,41 @@ def cmd_rebuild_cache():
 
 def cmd_list_command(pattern: Optional[str] = None):
     """列出所有可用命令"""
+    if not check_settings_exists():
+        print("错误：未初始化，请先执行 'sercli init'")
+        return 1
+    
     found_any = False
-    for module_file in sorted(MODULES_DIR.glob("*.json")):
-        module_name = module_file.stem
-        module_data = load_module(module_name)
+    
+    for module_dir in sorted(MODULE_BASE_DIR.iterdir()):
+        if not module_dir.is_dir():
+            continue
         
-        commands = {k: v for k, v in module_data.items() if not k.startswith("__")}
+        package_name = module_dir.name
+        module_data = load_module(package_name)
+        if not module_data:
+            continue
+        
+        commands = get_commands_from_module(module_data)
+        if not commands:
+            continue
         
         if pattern:
             matched = {k: v for k, v in commands.items() if pattern in k}
             if matched:
                 found_any = True
-                print(f"\n模块: {module_name}")
+                source = module_data.get("source", "local")
+                version = module_data.get("version", "0.0.0")
+                print(f"\n模块: {package_name} (source: {source}, version: {version})")
                 for cmd, val in sorted(matched.items()):
-                    display_val = format_command_value(val)
-                    print(f"  {cmd} -> {display_val}")
+                    print(f"  {cmd} -> {format_command_value(val)}")
         else:
-            if commands:
-                found_any = True
-                print(f"\n模块: {module_name}")
-                for cmd, val in sorted(commands.items()):
-                    display_val = format_command_value(val)
-                    print(f"  {cmd} -> {display_val}")
+            found_any = True
+            source = module_data.get("source", "local")
+            version = module_data.get("version", "0.0.0")
+            print(f"\n模块: {package_name} (source: {source}, version: {version})")
+            for cmd, val in sorted(commands.items()):
+                print(f"  {cmd} -> {format_command_value(val)}")
     
     if not found_any:
         if pattern:
@@ -780,59 +1319,60 @@ def cmd_list_command(pattern: Optional[str] = None):
     
     return 0
 
-def format_command_value(value: str) -> str:
-    """格式化命令值显示"""
-    if value.startswith("function."):
-        return value
-    return value
-
 def cmd_list_module():
     """列出所有模块"""
+    if not check_settings_exists():
+        print("错误：未初始化，请先执行 'sercli init'")
+        return 1
+    
     modules = []
-    for module_file in sorted(MODULES_DIR.glob("*.json")):
-        module_name = module_file.stem
-        module_data = load_module(module_name)
-        link = module_data.get("__link__", "")
-        if link:
-            modules.append(f"{module_name} (链接: {link})")
-        else:
-            modules.append(module_name)
+    for module_dir in sorted(MODULE_BASE_DIR.iterdir()):
+        if not module_dir.is_dir():
+            continue
+        module_data = load_module(module_dir.name)
+        if module_data:
+            source = module_data.get("source", "local")
+            version = module_data.get("version", "0.0.0")
+            modules.append(f"{module_dir.name} (source: {source}, version: {version})")
     
     if modules:
         print("已创建的模块:")
         for m in modules:
             print(f"  {m}")
     else:
-        print("暂无模块，请使用 'sercli create module <名称>' 创建")
+        print("暂无模块")
     
     return 0
 
-def cmd_info(module_name: str):
+def cmd_info(package_name: str):
     """查看模块信息"""
-    module_data = load_module(module_name)
-    if not module_data:
-        print(f"错误：模块 '{module_name}' 不存在")
+    if not check_settings_exists():
+        print("错误：未初始化，请先执行 'sercli init'")
         return 1
     
-    print(f"模块: {module_name}")
+    module_data = load_module(package_name)
+    if not module_data:
+        print(f"错误：模块 '{package_name}' 不存在")
+        return 1
     
-    link = module_data.get("__link__", "")
-    if link:
-        print(f"链接名: {link}")
+    print(f"模块: {package_name}")
+    print(f"来源: {module_data.get('source', 'local')}")
+    print(f"版本: {module_data.get('version', '0.0.0')}")
+    print(f"模块目录: {get_module_dir(package_name)}")
+    print(f"数据目录: {get_module_data_dir(package_name)}")
     
-    commands = {k: v for k, v in module_data.items() if not k.startswith("__")}
+    commands = get_commands_from_module(module_data)
     if commands:
         print(f"子命令数量: {len(commands)}")
         print("子命令列表:")
         for cmd, val in sorted(commands.items()):
-            display_val = format_command_value(val)
-            print(f"  {cmd} -> {display_val}")
+            print(f"  {cmd} -> {format_command_value(val)}")
     else:
         print("暂无子命令")
     
-    func_dir = get_function_dir(module_name)
-    if func_dir.exists():
-        scripts = list(func_dir.iterdir())
+    function_dir = get_function_dir(package_name)
+    if function_dir.exists():
+        scripts = list(function_dir.iterdir())
         if scripts:
             print(f"函数文件 ({len(scripts)}个):")
             for script in scripts:
@@ -840,25 +1380,274 @@ def cmd_info(module_name: str):
     
     return 0
 
-def cmd_execute(module_name: str, subcommand: str):
-    """执行子命令"""
-    settings = load_settings()
-    force_mode = settings.get("force", "off")
-    max_redirect = settings.get("redirect", 100)
-    
-    resolved = resolve_command(module_name, subcommand, max_depth=max_redirect if max_redirect > 0 else None)
-    
-    if resolved is None:
-        print(f"错误：找不到命令 '{module_name}.{subcommand}'")
+# ============================================================
+# 包管理命令
+# ============================================================
+
+def cmd_update():
+    """从中心服务器拉取包清单"""
+    if not check_settings_exists():
+        print("错误：未初始化，请先执行 'sercli init'")
         return 1
     
-    # 如果是函数调用
-    if resolved.startswith("function."):
-        return execute_function(resolved)
+    settings = load_settings()
+    repo_url = settings.get("repo", "")
+    if not repo_url:
+        print("错误：未配置中心服务器地址 (repo)")
+        print("请在 settings.json 中设置 'repo' 字段")
+        return 1
     
-    # 不应该到达这里，因为 set command 只接受 function 和别名
-    print(f"错误：无效的命令引用 '{resolved}'")
-    return 1
+    manifest_url = repo_url.rstrip('/') + "/manifest.json"
+    print(f"正在从 {manifest_url} 拉取清单...")
+    
+    try:
+        with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
+            tmp_path = Path(tmp_file.name)
+        
+        urllib.request.urlretrieve(manifest_url, str(tmp_path))
+        
+        try:
+            manifest_data = json.loads(tmp_path.read_text())
+            if "list" not in manifest_data:
+                print("错误：清单格式无效，缺少 'list' 字段")
+                return 1
+        except json.JSONDecodeError as e:
+            print(f"错误：清单格式无效 - {e}")
+            return 1
+        
+        shutil.move(str(tmp_path), str(MANIFEST_FILE))
+        print(f"清单更新成功，共 {len(manifest_data['list'])} 个包")
+        return 0
+    except Exception as e:
+        print(f"更新失败: {e}")
+        return 1
+
+def cmd_add(package_names: List[str]):
+    """安装一个或多个包"""
+    if not check_settings_exists():
+        print("错误：未初始化，请先执行 'sercli init'")
+        return 1
+    
+    if not package_names:
+        print("错误：请指定要安装的包名")
+        return 1
+    
+    manifest = load_manifest()
+    if not manifest.get("list"):
+        print("错误：清单为空，请先执行 'sercli update' 拉取清单")
+        return 1
+    
+    package_map = {item["package"]: item["url"] for item in manifest["list"] if "package" in item and "url" in item}
+    
+    success = True
+    for package_name in package_names:
+        if package_name not in package_map:
+            print(f"错误：包 '{package_name}' 不在清单中")
+            success = False
+            continue
+        
+        if not install_package(package_name, package_map[package_name]):
+            success = False
+    
+    if success:
+        settings = load_settings()
+        force_mode = settings.get("force", "off")
+        if force_mode != "off":
+            rebuild_sudo_cache()
+            violations = check_sudo_violations()
+            handle_sudo_violations(violations, f"安装包 {' '.join(package_names)}")
+        
+        print("\n所有包安装完成")
+        return 0
+    else:
+        return 1
+
+def cmd_upgrade(package_names: Optional[List[str]] = None):
+    """升级包"""
+    if not check_settings_exists():
+        print("错误：未初始化，请先执行 'sercli init'")
+        return 1
+    
+    if package_names:
+        manifest = load_manifest()
+        if not manifest.get("list"):
+            print("错误：清单为空，请先执行 'sercli update' 拉取清单")
+            return 1
+        
+        package_map = {item["package"]: item["url"] for item in manifest["list"] if "package" in item and "url" in item}
+        
+        success = True
+        for package_name in package_names:
+            if package_name not in package_map:
+                print(f"错误：包 '{package_name}' 不在清单中")
+                success = False
+                continue
+            
+            module_data = load_module(package_name)
+            if not module_data:
+                print(f"错误：模块 '{package_name}' 未安装")
+                success = False
+                continue
+            
+            source = module_data.get("source", "local")
+            if source == "noupdate":
+                print(f"跳过 '{package_name}' (已暂停更新)")
+                continue
+            if source == "local":
+                print(f"跳过 '{package_name}' (本地模块)")
+                continue
+            
+            latest_version = None
+            for item in manifest["list"]:
+                if item["package"] == package_name and "version" in item:
+                    latest_version = item["version"]
+                    break
+            
+            current_version = module_data.get("version", "0.0.0")
+            if latest_version and version_compare(current_version, latest_version) >= 0:
+                print(f"'{package_name}' 已是最新版本 ({current_version})")
+                continue
+            
+            if not install_package(package_name, package_map[package_name]):
+                success = False
+        
+        if success:
+            settings = load_settings()
+            force_mode = settings.get("force", "off")
+            if force_mode != "off":
+                rebuild_sudo_cache()
+                violations = check_sudo_violations()
+                handle_sudo_violations(violations, f"升级包 {' '.join(package_names)}")
+            return 0
+        else:
+            return 1
+    
+    else:
+        manifest = load_manifest()
+        if not manifest.get("list"):
+            print("错误：清单为空，请先执行 'sercli update' 拉取清单")
+            return 1
+        
+        package_map = {item["package"]: item["url"] for item in manifest["list"] if "package" in item and "url" in item}
+        
+        packages_to_upgrade = []
+        for module_dir in MODULE_BASE_DIR.iterdir():
+            if not module_dir.is_dir():
+                continue
+            
+            package_name = module_dir.name
+            module_data = load_module(package_name)
+            if not module_data:
+                continue
+            
+            source = module_data.get("source", "local")
+            if source != "repo":
+                continue
+            
+            latest_version = None
+            for item in manifest["list"]:
+                if item["package"] == package_name and "version" in item:
+                    latest_version = item["version"]
+                    break
+            
+            current_version = module_data.get("version", "0.0.0")
+            if latest_version and version_compare(current_version, latest_version) < 0:
+                packages_to_upgrade.append(package_name)
+            else:
+                print(f"'{package_name}' 已是最新版本 ({current_version})")
+        
+        if not packages_to_upgrade:
+            print("所有包已是最新版本")
+            return 0
+        
+        print(f"发现 {len(packages_to_upgrade)} 个包需要升级:")
+        for pkg in packages_to_upgrade:
+            print(f"  - {pkg}")
+        
+        success = True
+        for package_name in packages_to_upgrade:
+            if package_name not in package_map:
+                print(f"错误：包 '{package_name}' 不在清单中")
+                success = False
+                continue
+            
+            if not install_package(package_name, package_map[package_name]):
+                success = False
+        
+        if success:
+            settings = load_settings()
+            force_mode = settings.get("force", "off")
+            if force_mode != "off":
+                rebuild_sudo_cache()
+                violations = check_sudo_violations()
+                handle_sudo_violations(violations, "全量升级")
+            return 0
+        else:
+            return 1
+
+def cmd_offupdate(package_names: List[str]):
+    """暂停指定包的更新"""
+    if not check_settings_exists():
+        print("错误：未初始化，请先执行 'sercli init'")
+        return 1
+    
+    if not package_names:
+        print("错误：请指定要暂停更新的包名")
+        return 1
+    
+    success = True
+    for package_name in package_names:
+        module_data = load_module(package_name)
+        if not module_data:
+            print(f"错误：模块 '{package_name}' 不存在")
+            success = False
+            continue
+        
+        if module_data.get("source") == "local":
+            print(f"跳过 '{package_name}' (本地模块)")
+            continue
+        
+        if module_data.get("source") == "noupdate":
+            print(f"'{package_name}' 已暂停更新")
+            continue
+        
+        module_data["source"] = "noupdate"
+        save_module(package_name, module_data)
+        print(f"已暂停 '{package_name}' 的更新")
+    
+    return 0 if success else 1
+
+def cmd_onupdate(package_names: List[str]):
+    """恢复指定包的更新"""
+    if not check_settings_exists():
+        print("错误：未初始化，请先执行 'sercli init'")
+        return 1
+    
+    if not package_names:
+        print("错误：请指定要恢复更新的包名")
+        return 1
+    
+    success = True
+    for package_name in package_names:
+        module_data = load_module(package_name)
+        if not module_data:
+            print(f"错误：模块 '{package_name}' 不存在")
+            success = False
+            continue
+        
+        if module_data.get("source") == "local":
+            print(f"跳过 '{package_name}' (本地模块)")
+            continue
+        
+        if module_data.get("source") == "repo":
+            print(f"'{package_name}' 已经是 repo 状态")
+            continue
+        
+        module_data["source"] = "repo"
+        save_module(package_name, module_data)
+        print(f"已恢复 '{package_name}' 的更新")
+    
+    return 0 if success else 1
 
 # ============================================================
 # 主入口
@@ -870,48 +1659,46 @@ def print_usage():
 
 用法：
   sercli <命令> [参数...]
-  sercli <模块名> <子命令>
+  sercli <模块名> <子命令> [参数...]
+
+初始化：
+  sercli init                                  初始化配置
 
 模块管理：
-  sercli create module <模块名>           创建模块
-  
-  sercli delete module <模块名>           删除模块
-  
+  sercli create mod <模块名>                   创建模块
+  sercli delete mod <模块名>                   删除模块
+
 子命令管理：
-  sercli set command <模块> <子命令>=<别名>           设定别名（指向同模块子命令）
-  
-  sercli set command <模块> <子命令>=function.<文件名>  设定子命令指向脚本文件（默认函数名与子命令相同）
-  
-  sercli set command <模块> <子命令>=function.<文件名>(<函数名>)  设定子命令指向脚本中的指定函数
-  
-  sercli set command <模块> <子命令>=NULL              删除子命令
-  
-  sercli delete command <模块> <子命令>                删除子命令
+  sercli set cmd <模块> <子命令>=<值>          设置子命令
+  sercli delete cmd <模块> <子命令>            删除子命令
 
-函数导入：
-  sercli import function <模块> <子命令>=<脚本路径>     从脚本路径导入函数作为子命令
-  
-  示例：sercli import function nginx restart=./restart.sh
+脚本导入：
+  sercli import sh <模块名> <文件路径>             导入整个脚本
+  sercli import sh <模块名> <文件路径> --nocmd    导入脚本不自动创建子命令
+  sercli import cmd <模块名> <子命令>=<文件路径>   导入单个命令脚本
 
-快速调用：
-  sercli set module <模块名> link="<链接名>"           设置模块链接名，配合软链接使用（如 ngcli start）
-  
-  注：如无软链接权限，可使用 alias xxx="MODULE_NAME=xxx sercli"，无需 set module link
+包管理：
+  sercli update                                   拉取包清单
+  sercli add <包名1> <包名2> ...                  安装包
+  sercli upgrade [包名1] [包名2] ...             升级包（默认全量升级）
+  sercli offupdate <包名1> <包名2> ...           暂停更新
+  sercli onupdate <包名1> <包名2> ...            恢复更新
 
 其他设置：
-  sercli set sort module        模块在前（默认）
-  sercli set sort command       命令在前
-  sercli set redirect <数值>    设置重定向限制
+  sercli set sort module/command   设置调用顺序
+  sercli set redirect <数值>       设置重定向限制
   sercli set force true/false/off  设置严格模式
+  sercli set repo <URL>           设置中心服务器地址
+  sercli set shell <路径>         设置 shell 解释器路径
 
 安全审计：
-  sercli check sudo             检查 sudo 配置
-  sercli rebuild cache          重建命令缓存
+  sercli check sudo   检查 sudo 配置
+  sercli rebuild cache 重建命令缓存
 
 查询：
-  sercli list command [匹配模式]  列出命令（支持匹配模式过滤）
-  sercli list module             列出所有模块
-  sercli info <模块名>           查看模块详细信息""")
+  sercli list cmd [匹配模式]  列出命令
+  sercli list mod            列出所有模块
+  sercli info <模块名>       查看模块详细信息""")
 
 def main():
     """主函数"""
@@ -924,35 +1711,26 @@ def main():
     env_module = os.environ.get("MODULE_NAME", "")
     invoked_as = safe_basename(sys.argv[0])
     
-    # 尝试通过链接名匹配模块
-    link_match = None
-    if invoked_as != "sercli":
-        for module_file in MODULES_DIR.glob("*.json"):
-            module_data = load_module(module_file.stem)
-            if module_data.get("__link__") == invoked_as:
-                link_match = module_file.stem
-                break
-    
     first_arg = sys.argv[1]
     
     # ========== 命令分发 ==========
     
-    # create module
-    if first_arg == "create" and len(sys.argv) >= 3 and sys.argv[2] == "module":
+    if first_arg == "init":
+        return cmd_init()
+    
+    if first_arg == "create" and len(sys.argv) >= 3 and sys.argv[2] in ["mod", "module"]:
         if len(sys.argv) < 4:
             print("错误：请指定模块名")
             return 1
         return cmd_create_module(sys.argv[3])
     
-    # delete module
-    if first_arg == "delete" and len(sys.argv) >= 3 and sys.argv[2] == "module":
+    if first_arg == "delete" and len(sys.argv) >= 3 and sys.argv[2] in ["mod", "module"]:
         if len(sys.argv) < 4:
             print("错误：请指定模块名")
             return 1
         return cmd_delete_module(sys.argv[3])
     
-    # set command
-    if first_arg == "set" and len(sys.argv) >= 4 and sys.argv[2] == "command":
+    if first_arg == "set" and len(sys.argv) >= 4 and sys.argv[2] in ["cmd", "command"]:
         if len(sys.argv) < 5:
             print("错误：请指定模块名、子命令名和值")
             return 1
@@ -965,15 +1743,37 @@ def main():
         value = eq_parts[1]
         return cmd_set_command(module_name, subcommand, value)
     
-    # delete command
-    if first_arg == "delete" and len(sys.argv) >= 4 and sys.argv[2] == "command":
+    if first_arg == "set" and len(sys.argv) >= 3 and sys.argv[2] == "repo":
+        if len(sys.argv) < 4:
+            print("错误：请指定仓库地址")
+            return 1
+        return cmd_set_repo(sys.argv[3])
+    
+    if first_arg == "set" and len(sys.argv) >= 3 and sys.argv[2] == "shell":
+        if len(sys.argv) < 4:
+            print("错误：请指定 shell 解释器路径")
+            return 1
+        return cmd_set_shell(sys.argv[3])
+    
+    if first_arg == "delete" and len(sys.argv) >= 4 and sys.argv[2] in ["cmd", "command"]:
         if len(sys.argv) < 5:
             print("错误：请指定模块名和子命令名")
             return 1
         return cmd_delete_command(sys.argv[3], sys.argv[4])
     
-    # import function
-    if first_arg == "import" and len(sys.argv) >= 4 and sys.argv[2] == "function":
+    if first_arg == "import" and len(sys.argv) >= 4 and sys.argv[2] == "sh":
+        if len(sys.argv) < 5:
+            print("错误：请指定模块名和脚本路径")
+            return 1
+        module_name = sys.argv[3]
+        script_path = sys.argv[4]
+        auto_create = True
+        if len(sys.argv) >= 6:
+            if sys.argv[5] in ["--nocmd", "--nocommand"]:
+                auto_create = False
+        return cmd_import_sh(module_name, script_path, auto_create)
+    
+    if first_arg == "import" and len(sys.argv) >= 4 and sys.argv[2] in ["cmd", "command"]:
         if len(sys.argv) < 5:
             print("错误：请指定模块名和导入参数")
             return 1
@@ -984,82 +1784,96 @@ def main():
             return 1
         subcommand = eq_parts[0]
         script_path = eq_parts[1]
-        return cmd_import_function(module_name, subcommand, script_path)
+        return cmd_import_cmd(module_name, subcommand, script_path)
     
-    # set module link
-    if first_arg == "set" and len(sys.argv) >= 5 and sys.argv[2] == "module" and "=" in sys.argv[4]:
-        if len(sys.argv) < 5:
-            print("错误：请指定模块名和链接名")
-            return 1
-        module_name = sys.argv[3]
-        eq_parts = sys.argv[4].split("=", 1)
-        if len(eq_parts) != 2 or eq_parts[0] != "link":
-            print("错误：格式错误，应为 link=<链接名>")
-            return 1
-        link_name = eq_parts[1].strip('"').strip("'")
-        return cmd_set_module_link(module_name, link_name)
-    
-    # set sort
-    if first_arg == "set" and len(sys.argv) >= 4 and sys.argv[2] == "sort":
+    if first_arg == "set" and len(sys.argv) >= 3 and sys.argv[2] == "sort":
         if len(sys.argv) < 4:
             print("错误：请指定排序模式")
             return 1
         return cmd_set_sort(sys.argv[3])
     
-    # set redirect
     if first_arg == "set" and len(sys.argv) >= 3 and sys.argv[2] == "redirect":
         if len(sys.argv) < 4:
             print("错误：请指定数值")
             return 1
         return cmd_set_redirect(sys.argv[3])
     
-    # set force
     if first_arg == "set" and len(sys.argv) >= 3 and sys.argv[2] == "force":
         if len(sys.argv) < 4:
             print("错误：请指定模式")
             return 1
         return cmd_set_force(sys.argv[3])
     
-    # check sudo
     if first_arg == "check" and len(sys.argv) >= 3 and sys.argv[2] == "sudo":
         return cmd_check_sudo()
     
-    # rebuild cache
     if first_arg == "rebuild" and len(sys.argv) >= 3 and sys.argv[2] == "cache":
         return cmd_rebuild_cache()
     
-    # list command
-    if first_arg == "list" and len(sys.argv) >= 3 and sys.argv[2] == "command":
+    if first_arg == "update":
+        return cmd_update()
+    
+    if first_arg == "add":
+        if len(sys.argv) < 3:
+            print("错误：请指定要安装的包名")
+            return 1
+        return cmd_add(sys.argv[2:])
+    
+    if first_arg == "upgrade":
+        if len(sys.argv) >= 3:
+            return cmd_upgrade(sys.argv[2:])
+        else:
+            return cmd_upgrade(None)
+    
+    if first_arg == "offupdate":
+        if len(sys.argv) < 3:
+            print("错误：请指定要暂停更新的包名")
+            return 1
+        return cmd_offupdate(sys.argv[2:])
+    
+    if first_arg == "onupdate":
+        if len(sys.argv) < 3:
+            print("错误：请指定要恢复更新的包名")
+            return 1
+        return cmd_onupdate(sys.argv[2:])
+    
+    if first_arg == "list" and len(sys.argv) >= 3 and sys.argv[2] in ["cmd", "command"]:
         pattern = sys.argv[3] if len(sys.argv) >= 4 else None
         return cmd_list_command(pattern)
     
-    # list module
-    if first_arg == "list" and len(sys.argv) >= 3 and sys.argv[2] == "module":
+    if first_arg == "list" and len(sys.argv) >= 3 and sys.argv[2] in ["mod", "module"]:
         return cmd_list_module()
     
-    # info
     if first_arg == "info" and len(sys.argv) >= 3:
         return cmd_info(sys.argv[2])
     
-    # help
     if first_arg in ["help", "--help", "-h"]:
         print_usage()
         return 0
     
     # ========== 执行模式 ==========
+    if not check_settings_exists():
+        print("错误：未初始化，请先执行 'sercli init'")
+        return 1
+    
     sort_mode = load_settings().get("sort", "module")
     
-    if link_match:
-        return cmd_execute(link_match, first_arg)
-    
     if env_module:
-        return cmd_execute(env_module, first_arg)
+        subcommand = first_arg
+        args = sys.argv[2:] if len(sys.argv) > 2 else []
+        return cmd_execute(env_module, subcommand, args)
     
     if sort_mode == "command" and len(sys.argv) >= 3:
-        return cmd_execute(sys.argv[2], first_arg)
+        subcommand = first_arg
+        module_name = sys.argv[2]
+        args = sys.argv[3:] if len(sys.argv) > 3 else []
+        return cmd_execute(module_name, subcommand, args)
     
     if len(sys.argv) >= 3:
-        return cmd_execute(first_arg, sys.argv[2])
+        module_name = first_arg
+        subcommand = sys.argv[2]
+        args = sys.argv[3:] if len(sys.argv) > 3 else []
+        return cmd_execute(module_name, subcommand, args)
     
     print(f"错误：未知命令 '{first_arg}'")
     print("使用 'sercli help' 查看帮助")
